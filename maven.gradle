@@ -1,0 +1,490 @@
+import java.lang.reflect.Field
+import java.text.SimpleDateFormat
+
+/**
+ * 用于在构建基于Gradle的Android Application/Library时,向APK/AAR中添加构建信息,打包JavaDoc,JavaSource,
+ * ProgruardMapping,并向Maven仓库提交.
+ * 注:为提高开发效率,仅当构建过程满足isExpectBuild()方法的判定条件时,上述过程才会执行.
+ *
+ * 使用方法,在build.gradle中添加
+ *      apply from: 'maven.gradle'
+ * 并在gradle.properties中配置下列参数
+
+ #控制开关
+ publish_is_upload_remote = false                       //true:提交到远程仓库,false:提交到${project.rootDir}/repo目录下
+ publish_is_build_javadoc = true                        //是否生成JavaDoc以及打包Source
+
+ #版本相关设置
+ publish_group_id=com.myapp                             //your group_id
+ publish_artifact_id=365TaoFang                         //your artifact_id
+ publish_version=6.1.5-SNAPSHOT                         //your version
+ publish_version_code=615
+
+ #仓库相关设置
+ release_repository_url=ftp://192.168.108.42/projects/
+ snapshot_repository_url=ftp://192.168.108.42/projects/
+ nexus_username=your_username
+ nexus_password=your_password
+
+ */
+apply plugin: 'maven'
+apply plugin: 'nebula.info'
+
+configurations {
+    deployerJars
+}
+
+dependencies {
+    deployerJars 'org.apache.maven.wagon:wagon-ftp:2.2'
+}
+
+def groupId = project.publish_group_id
+def artifactId = project.publish_artifact_id
+def version = project.publish_version
+
+def localReleaseDest = "${project.getRootDir()}/repo"
+
+@groovy.transform.Field private final java.util.Date date = new Date()
+
+def getReleaseRepositoryUrl() {
+    return hasProperty('release_repository_url') ? release_repository_url
+            : "http://192.168.108.60/nexus/content/repositories/releases/"
+}
+
+def getSnapshotRepositoryUrl() {
+    return hasProperty('snapshot_repository_url') ? snapshot_repository_url
+            : "http://192.168.108.60/nexus/content/repositories/snapshots/"
+}
+
+def getRepositoryUsername() {
+    return hasProperty('nexus_username') ? nexus_username : ""
+}
+
+def getRepositoryPassword() {
+    return hasProperty('nexus_password') ? nexus_password : ""
+}
+
+def isUploadRemoteMaven() {
+    return hasProperty('publish_is_upload_remote') ? publish_is_upload_remote.toBoolean() : false
+}
+
+def isBuildJavaDoc() {
+    return hasProperty('publish_is_build_javadoc') ? publish_is_build_javadoc.toBoolean() : false
+}
+
+def getAndroidGradlePluginVersion() {
+    Class<?> clazz = Class.forName("com.android.builder.model.Version", false, project.getBuildscript().getClassLoader());
+    Field field = clazz.getField("ANDROID_GRADLE_PLUGIN_VERSION");
+    String androidGradlePluginVersion = (String) field.get(clazz);
+    String[] strings = androidGradlePluginVersion.split("-");
+    return strings[0];
+}
+
+clean.doFirst {
+    delete "file://${localReleaseDest}"
+}
+
+uploadArchives
+        {
+            repositories.mavenDeployer {
+                //添加FTP协议支持.
+                addProtocolProviderJars configurations.deployerJars.files
+
+                pom.groupId = groupId
+                pom.artifactId = artifactId
+                pom.version = version
+                // Add other pom properties here if you want (developer details / licenses)
+
+                repository(url: "file://${localReleaseDest}")
+                if (isUploadRemoteMaven()) {
+                    // 关闭上传至私有Maven仓库
+                    repository(url: getReleaseRepositoryUrl()) {
+                        authentication(userName: getRepositoryUsername(), password: getRepositoryPassword())
+                    }
+                    snapshotRepository(url: getSnapshotRepositoryUrl()) {
+                        authentication(userName: getRepositoryUsername(), password: getRepositoryPassword())
+                    }
+                }
+            }
+        }
+
+/**
+ * 归档APK文件.
+ */
+private String defArchiveApkTasks(variant) {
+    def variantData = variant.variantData
+    final configuration = variantData.variantConfiguration
+    def archiveApkTaskName = "archive${variant.name.capitalize()}Apk"
+    def writeManifestPropertiesTask = tasks.getByName("writeManifestProperties")
+
+    task(archiveApkTaskName, dependsOn: writeManifestPropertiesTask) {
+        group "archive"
+        description = 'APK file archiving. '
+        Map<String, ?> manifest = writeManifestPropertiesTask.getManifest()
+        for (Map.Entry<String, ?> entry : manifest.entrySet()) {
+            String fieldName = entry.getKey();
+            if (entry != null && fieldName != null) {
+                fieldName = fieldName.replace("-", "_");
+                final boolean matches = fieldName.matches("^[a-zA-Z_\$][a-zA-Z_\$0-9]*\$");
+                if (matches) {
+                    String fieldValue = entry.getValue() != null ? entry.getValue().toString() : "";
+                    fieldValue = fieldValue.replace("\\", "\\\\");
+                    fieldValue.replace("\"", "\\\"");
+                    configuration.addBuildConfigField("String", fieldName, "\"" + fieldValue + "\"");
+                } else {
+                    logger.log(LogLevel.WARN, "Lost BuildConfigField,illegal name :" + fieldName)
+                }
+            }
+        }
+        SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm");
+        configuration.addBuildConfigField("String", "Build_Date", "\"" + sdf.format(date) + "\"");
+        String revision = manifest.get("Change");
+        variant.outputs.each { output ->
+            ext.destFile = output.outputFile
+            if (revision == null)
+                revision = ""
+            ext.destRevision = revision
+        }
+    }
+    tasks.getByName(variantData.getTaskName("generate", "BuildConfig")).dependsOn(archiveApkTaskName)
+    return archiveApkTaskName
+}
+
+def defJavaDocAndJavaSourceTasks = { dependsOnTaskName, variant, variantPrefix ->
+    task("generate${variant.name.capitalize()}Javadoc", type: Javadoc, dependsOn: dependsOnTaskName) {
+        description "Generates Javadoc for $project.name."
+        group "javadoc"
+        source = variant.javaCompile.source
+        // compatible android gradle plugin 3.1
+
+        def taskName = variant.variantData.getScope().getTaskName("compile", "JavaWithJavac")
+        def classFiles = project.tasks.findByName(taskName).getClasspath()
+        options {
+            failOnError false
+            encoding "utf-8"
+            charSet "utf-8"
+            links "http://docs.oracle.com/javase/7/docs/api/"
+            linksOffline "http://d.android.com/reference", "${android.sdkDirectory}/docs/reference"
+        }
+        // fix java 8 very strict.
+        if (JavaVersion.current().isJava8Compatible()) {
+            options.addStringOption('Xdoclint:none', '-quiet')
+        }
+//        exclude '**/BuildConfig.java'
+        exclude '**/R.java'
+    }
+    if (variantPrefix != null) {
+        variantPrefix = variantPrefix + "-"
+    } else {
+        variantPrefix = ""
+    }
+    task("jar${variant.name.capitalize()}Javadoc", type: Jar, dependsOn: "generate${variant.name.capitalize()}Javadoc") {
+        group "archive"
+        description "Jar Javadoc for $project.name."
+        classifier = "${variantPrefix}javadoc"
+        from tasks.getByName("generate${variant.name.capitalize()}Javadoc").destinationDir
+    }
+
+    task("jar${variant.name.capitalize()}Sources", type: Jar, dependsOn: dependsOnTaskName) {
+        group "archive"
+        description "Jar sources for $project.name."
+        classifier = "${variantPrefix}sources"
+        from variant.javaCompile.source
+    }
+}
+
+def defZipProgruardMappingTask = { dependsOnTaskName, variant ->
+    if (variant.buildType.minifyEnabled) {
+        String variantPrefix = variant.buildType.name
+        if (variant.flavorName != null
+                && !"".equals(variant.flavorName))
+            variantPrefix = variant.flavorName + "-" + variantPrefix
+        task("zip${variant.name.capitalize()}ProguardMapping", type: Zip, dependsOn: dependsOnTaskName) {
+            group "archive"
+            description = 'Assembles a ZIP archive containing the Proguard files of $variant.name..'
+            classifier "${variantPrefix}-proguard"
+            destinationDir = new File("$project.buildDir/libs/") // 设置和Jar默认路径一致.
+            from "$project.buildDir/outputs/mapping/${variant.getDirName()}"
+        }
+    }
+}
+
+def defGenerateManifestTask = { dependsOnTaskName, variant ->
+    final configuration = variant.variantData.variantConfiguration
+    def writeManifestPropertiesTask = tasks.getByName("writeManifestProperties")
+    def processJavaRes = tasks.getByName("process${configuration.fullName.capitalize()}JavaRes")
+
+    def manifestOutputDir = project.file(new File(project.buildDir, "generated/resources/manifest"))
+    def manifestOutput = new File(manifestOutputDir, variant.dirName)
+    processJavaRes.from(manifestOutput)
+
+    def generateManifestTask = task("generate${variant.name.capitalize()}ManifestProperties").doLast {
+        Properties properties = new Properties() {
+            @Override
+            public synchronized Enumeration<Object> keys() {
+                return Collections.enumeration(new TreeSet<Object>(super.keySet()));
+            }
+        };
+        FileInputStream inputStream = new FileInputStream(writeManifestPropertiesTask.getPropertiesFile())
+        properties.load(inputStream)
+        inputStream.close()
+        properties.put("X-Android-PackageName", configuration.applicationId + "")
+        properties.put("X-Android-VersionName", configuration.getVersionName() + "")
+        properties.put("X-Android-VersionCode", configuration.getVersionCode() + "")
+        properties.put("X-Android-FullName", configuration.fullName)
+        properties.put("X-Android-BuildType", variant.buildType.name)
+        properties.put("X-Android-FlavorName", variant.flavorName)
+        properties.put("X-Android-MinSdkVersion", configuration.minSdkVersion.getApiString())
+        properties.put("X-Android-TargetSdkVersion", configuration.targetSdkVersion.getApiString())
+
+        File outputFile
+        if (variant.variantData.getClass().name.contains("ApplicationVariantData"))
+            outputFile = new File("${manifestOutput}/META-INF/build-info.properties")
+        else {
+            outputFile = new File("${manifestOutput}/META-INF/${configuration.applicationId}.properties")
+        }
+
+        if (outputFile.exists()) {
+            Properties oldProp = new Properties();
+            FileInputStream fileInputStream = new FileInputStream(outputFile)
+            oldProp.load(fileInputStream)
+            oldProp.remove("Build-Date");
+            final buildDate = properties.remove("Build-Date");
+            if (!oldProp.equals(properties)) {
+                properties.put("Build-Date", buildDate)
+            }
+            fileInputStream.close()
+        } else {
+            if (!outputFile.getParentFile().exists())
+                outputFile.getParentFile().mkdirs()
+            outputFile.createNewFile()
+        }
+
+        if (properties.containsKey("Build-Date")) {
+            try {
+                BufferedWriter bufferedWriter = new BufferedWriter(new FileWriter(outputFile))
+                properties.store(bufferedWriter, "\nAutomatic generated.\n\n@author ZhangZhenli\n")
+                bufferedWriter.flush()
+                bufferedWriter.close()
+            } catch (IOException e) {
+                throw e
+            }
+        }
+    }
+
+    generateManifestTask.dependsOn writeManifestPropertiesTask
+    processJavaRes.dependsOn generateManifestTask
+    project.tasks.findByName("generate${variant.name.capitalize()}Resources").dependsOn generateManifestTask
+}
+
+/**
+ * 针对Android Library Module 打包AAR，Jar，JavaDoc，JavaSource。
+ *
+ * 注意:不支持变种.
+ */
+if (project.getPlugins().hasPlugin('com.android.library')) {
+    android.libraryVariants.all { variant ->
+        final configuration = variant.variantData.variantConfiguration
+        String dependsOnTaskName = "assemble${configuration.fullName.capitalize()}"
+        boolean isBuild = isExpectBuild(configuration)
+        if (!"".equals(variant.flavorName)) {
+            throw new GradleException("Do not set flavors ,the current maven.gradle script does not support multiple flavors!")
+        }
+        if (isBuild || variant.buildType.name.equals("release")) {
+            if (isBuildJavaDoc()) {
+                String variantPrefix = null
+                defJavaDocAndJavaSourceTasks(dependsOnTaskName, variant, variantPrefix)
+            }
+
+            defZipProgruardMappingTask(dependsOnTaskName, variant)
+            defGenerateManifestTask(dependsOnTaskName, variant)
+            /**
+             * 打包当前代码为Jar文件.
+             * 你在使用该Jar文件的时候可能会出错,因为该Jar文件不包含需要的R文件,如果确需引用请确保你在类
+             * 中没有对R的引用,如果你的Android Library Module不包含任何资源文件或没有对其进行引用则可放
+             * 心使用。
+             */
+            def jarClassesWithoutRTaskName = "jar${variant.name.capitalize()}ClassesWithoutR"
+            task(jarClassesWithoutRTaskName, dependsOn: dependsOnTaskName) {
+                group "archive"
+                description = 'Assemble a JAR file, the same as the Jar file included with the AAR,does not include class R.'
+                if (project.getPlugins().hasPlugin("com.android.library")) {
+                    String leaf;
+                    String variantName = configuration.fullName;
+                    String stringVersion = getAndroidGradlePluginVersion();
+                    if (stringVersion.matches('^2.3.(\\*|\\d+)$')) {
+                        // version match
+                        if (android.getPublishNonDefault() ||
+                                !variantName.equals(android.getDefaultPublishConfig())) {
+                            leaf = variantName;
+                        } else {
+                            leaf = "default";
+                        }
+                    } else {
+                        leaf = variantName;
+                    }
+                    ext.destFile = project.file("${project.buildDir}/intermediates/bundles/${leaf}/classes.jar")
+                    if (stringVersion.matches('^3.1.(\\*|\\d+)$')) {
+                        ext.destFile = project.file("${project.buildDir}/intermediates/packaged-classes/${leaf}/classes.jar")
+                    }
+
+                } else {
+                    ext.destFile = project.file("${project.buildDir}/intermediates/classes-proguard/${variant.getDirName()}/classes.jar")
+                }
+            }
+
+            artifacts {
+                archives file: tasks.getByName(jarClassesWithoutRTaskName).destFile, classifier: 'jar', builtBy: tasks.getByName(jarClassesWithoutRTaskName)
+                if (variant.buildType.minifyEnabled) {
+                    archives tasks.getByName("zip${variant.name.capitalize()}ProguardMapping")
+                }
+                if (isBuildJavaDoc()) {
+                    archives tasks.getByName("jar${variant.name.capitalize()}Sources")
+                    archives tasks.getByName("jar${variant.name.capitalize()}Javadoc")
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 针对Android Application Module 打包JavaDoc，JavaSource。
+ */
+if (project.getPlugins().hasPlugin('com.android.application')) {
+    android.applicationVariants.all { variant ->
+        final configuration = variant.variantData.variantConfiguration
+        String dependsOnTaskName = "assemble${configuration.fullName.capitalize()}"
+
+        def archiveApkTaskName = defArchiveApkTasks(variant)
+        defGenerateManifestTask(dependsOnTaskName, variant)
+
+        boolean isBuild = isExpectBuild(configuration)
+        if (isBuild) {
+            if (isBuildJavaDoc()) {
+                String variantPrefix = variant.buildType.name
+                if (variant.flavorName != null
+                        && !"".equals(variant.flavorName))
+                    variantPrefix = variant.flavorName + "-" + variantPrefix
+                defJavaDocAndJavaSourceTasks(dependsOnTaskName, variant, variantPrefix)
+            }
+            defZipProgruardMappingTask(dependsOnTaskName, variant)
+
+            def uploadArchives = tasks.getByName("uploadArchives")
+            uploadArchives.dependsOn(dependsOnTaskName)
+//            println tasks.getByName("uploadArchives").doFirst {
+//                Set<File> fileSet = configuration.getArtifacts().getFiles().getFiles();
+//                for (def artifact : configuration.getArtifacts()) {
+//                    println artifact.getFile()
+//                    println artifact.name
+//                    println artifact.extension
+//                    println artifact.type
+//                    println artifact.classifier
+//                    println artifact.date
+//                    println new File(project.getBuildDir(), "ivy.xml")
+//                }
+//            }
+
+            String archiveRepoJson = "archiveRepoJson"
+            File file = new File(project.getRootDir(), "source.json")
+            if (file.exists() && tasks.findByName(archiveRepoJson) == null) {
+                task(archiveRepoJson) {
+                    ext.destFile = file
+                }
+            }
+            String archiveRepoMD = "archiveRepoMD"
+            file = new File(project.getRootDir(), "source.md")
+            if (file.exists() && tasks.findByName(archiveRepoMD) == null) {
+                task(archiveRepoMD) {
+                    ext.destFile = file
+                }
+            }
+            String archiveRepoHtml = "archiveRepoHtml"
+            file = new File(project.getRootDir(), "source.html")
+            if (file.exists() && tasks.findByName(archiveRepoHtml) == null) {
+                task(archiveRepoHtml) {
+                    ext.destFile = file
+                }
+            }
+
+
+            artifacts {
+                def task = tasks.getByName(archiveApkTaskName)
+                archives(tasks.getByName(archiveApkTaskName).destFile) {
+                    String destClassifier = task.destFile.getName()
+                    destClassifier = removeMavenPrefix(destClassifier, artifactId)
+                    destClassifier = removeMavenPrefix(destClassifier, version)
+                    destClassifier = removeMavenPrefix(destClassifier, (String) variant.mergedFlavor.versionCode)
+                    destClassifier = destClassifier.substring(0, destClassifier.lastIndexOf("."))
+                    destClassifier = (task.destRevision.equals("") ? "" : (task.destRevision + "-")) + destClassifier
+                    classifier destClassifier
+                    builtBy task
+                }
+                if (tasks.findByName(archiveRepoJson) != null)
+                    archives tasks.findByName(archiveRepoJson).destFile
+                if (tasks.findByName(archiveRepoMD) != null)
+                    archives tasks.findByName(archiveRepoMD).destFile
+                if (tasks.findByName(archiveRepoHtml) != null)
+                    archives tasks.findByName(archiveRepoHtml).destFile
+
+                if (variant.buildType.minifyEnabled) {
+                    archives tasks.getByName("zip${variant.name.capitalize()}ProguardMapping") {
+                        classifier = (task.destRevision.equals("") ? "" : (task.destRevision + "-")) + classifier
+                    }
+                }
+                if (isBuildJavaDoc()) {
+                    archives tasks.getByName("jar${variant.name.capitalize()}Sources") {
+                        classifier = (task.destRevision.equals("") ? "" : (task.destRevision + "-")) + classifier
+                    }
+                    archives tasks.getByName("jar${variant.name.capitalize()}Javadoc") {
+                        classifier = (task.destRevision.equals("") ? "" : (task.destRevision + "-")) + classifier
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * 检查当前构建过程是否需要添加额外的构建信息.
+ *
+ * @param variantConfiguration
+ * @return
+ */
+private boolean isExpectBuild(final variantConfiguration) {
+    final List<String> taskNames = project.getGradle().startParameter.taskNames;
+    boolean isExpect = false
+    for (String name : taskNames) {
+        def strings = name.split(":")
+        def taskName = strings[strings.length - 1]
+        if (taskName.equals("uploadArchives")
+                && project.name.equals(strings[strings.length - 2])
+                && taskNames.size() == 1
+                && !"debug".equals(variantConfiguration.buildType.name)) {
+            isExpect = true
+            break
+        }
+        String replace = taskName.replace("assemble", "")
+        if (replace.equalsIgnoreCase(variantConfiguration.fullName.capitalize())
+                || replace.equalsIgnoreCase(variantConfiguration.buildType.name)
+                || replace.equalsIgnoreCase(variantConfiguration.flavorName)) {
+            if (strings.length >= 2) {
+                if (project.name.equals(strings[strings.length - 2])) {
+                    isExpect = true
+                    break
+                }
+            }
+        }
+    }
+
+    return isExpect
+}
+
+private String removeMavenPrefix(String destClassifier, String artifactId) {
+    def indexOf = destClassifier.indexOf(artifactId)
+    if (indexOf == 0) {
+        destClassifier = destClassifier.replaceFirst(artifactId + "-", "")
+    } else if (indexOf > 0) {
+        destClassifier = destClassifier.replaceFirst("-" + artifactId, "")
+    }
+    return destClassifier
+}
