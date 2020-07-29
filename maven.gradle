@@ -88,7 +88,7 @@ uploadArchives
         {
             repositories.mavenDeployer {
                 //添加FTP协议支持.
-                addProtocolProviderJars configurations.deployerJars.files
+                configuration = configurations.deployerJars
 
                 pom.groupId = groupId
                 pom.artifactId = artifactId
